@@ -1,8 +1,13 @@
 import os
-from dotenv import load_dotenv
 from transformers import AutoTokenizer
 
-load_dotenv()  # loads .env into environment
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv()
 
 class Tokenizer:
     def __init__(self) -> None:
@@ -15,4 +20,3 @@ class Tokenizer:
 
     def get(self):
         return self.tokenizer
-

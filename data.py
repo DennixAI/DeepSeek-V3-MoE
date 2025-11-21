@@ -3,6 +3,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from transformers import AutoTokenizer
 from datasets import load_dataset
 import torch.distributed as dist
+from config import ModelArgs
 
 def initialize_tokenizer(hf_token=None):
     # Using Llama-3 tokenizer (Current standard for efficiency)
@@ -17,25 +18,35 @@ def initialize_tokenizer(hf_token=None):
     return tokenizer
 
 class FineWebStreamDataset(IterableDataset):
-    def __init__(self, split, tokenizer, seq_len, batch_size, world_size=1, rank=0, infinite=True):
+    def __init__(self, split, tokenizer, seq_len, batch_size, world_size=1, rank=0, infinite=True, dataset_name="HuggingFaceFW/fineweb-edu", dataset_config="sample-10BT", hf_token=None):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.split = split
+        self.split = split or "train"
         self.world_size = world_size
         self.rank = rank
         self.infinite = infinite
-        
-        # Load the streaming dataset
-        # "sample-10BT" is a smaller subset good for testing. 
-        # For full training, remove name="sample-10BT".
-        self.dataset = load_dataset(
-            "HuggingFaceFW/fineweb-edu", 
-            name="sample-10BT", 
-            split="train", 
-            streaming=True
-        )
-        
-        # Shard the dataset for DDP so each GPU gets different data
+
+        try:
+            self.dataset = load_dataset(
+                dataset_name,
+                name=dataset_config,
+                split=self.split,
+                streaming=True,
+                token=hf_token
+            )
+        except Exception:
+            if self.split != "train":
+                self.dataset = load_dataset(
+                    dataset_name,
+                    name=dataset_config,
+                    split="train",
+                    streaming=True,
+                    token=hf_token
+                )
+                self.split = "train"
+            else:
+                raise
+
         if self.world_size > 1:
             self.dataset = self.dataset.shard(num_shards=self.world_size, index=self.rank)
 
@@ -88,7 +99,7 @@ class FineWebStreamDataset(IterableDataset):
                 else:
                     break
 
-def prepare_dataset(split, device, batch_size, use_ddp=False):
+def prepare_dataset(split, device, batch_size, use_ddp=False, tokenizer=None, model_args=None):
     # DDP Setup
     if use_ddp:
         rank = dist.get_rank()
@@ -96,21 +107,20 @@ def prepare_dataset(split, device, batch_size, use_ddp=False):
     else:
         rank = 0
         world_size = 1
-        
-    args = from config import ModelArgs
-    tokenizer = initialize_tokenizer(ModelArgs.hf_token)
-    
-    # We use 'train' split for everything in streaming usually, 
-    # but strictly you should reserve a shard for validation.
-    # Here we just use the main stream.
+
+    model_args = model_args or ModelArgs()
+    tokenizer = tokenizer or initialize_tokenizer(model_args.hf_token)
+
     ds = FineWebStreamDataset(
-        split="train",
+        split=split,
         tokenizer=tokenizer, 
-        seq_len=ModelArgs.max_seq_len,
+        seq_len=model_args.max_seq_len,
         batch_size=batch_size,
         world_size=world_size,
         rank=rank,
-        infinite=(split == 'train')
+        infinite=(split == 'train'),
+        dataset_name=model_args.dataset,
+        hf_token=model_args.hf_token
     )
     
     # Num_workers > 0 ensures data loading is async on CPU

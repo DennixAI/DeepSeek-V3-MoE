@@ -1,21 +1,24 @@
-import time
 import torch
 import torch.nn.functional as F
 import math
 import tqdm 
 import os
-import wandb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from contextlib import nullcontext
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-# Muon
-from muon import MuonWithAuxAdam
+try:
+    from muon import MuonWithAuxAdam
+    HAS_MUON = True
+except ImportError:
+    HAS_MUON = False
 
-# Local
 from config import ModelArgs, get_args
 from model import DeepSeekV3
 from data import prepare_dataset, initialize_tokenizer
-from inference import topk_sampling, save_text
 
 def setup_ddp():
     dist.init_process_group(backend='nccl')
@@ -52,7 +55,10 @@ def train():
     if use_ddp:
         local_rank, world_size, rank, device = setup_ddp()
     else:
-        device = torch.device(model_args.device)
+        device_type = model_args.device
+        if device_type == "cuda" and not torch.cuda.is_available():
+            device_type = "cpu"
+        device = torch.device(device_type)
         rank = 0
         world_size = 1
         local_rank = 0
@@ -61,7 +67,6 @@ def train():
         print(f"Training on {device} | World Size: {world_size}")
         print(f"Dataset: {model_args.dataset}")
         print(f"Vocab Size: {model_args.vocab_size} (Llama-3)")
-        wandb.init(project=model_args.wandb_project, name=model_args.wandb_run_name, config=vars(model_args))
     
     # Model
     model = DeepSeekV3(model_args).to(device)
@@ -70,7 +75,11 @@ def train():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     base_model = model.module if use_ddp else model
-    
+    def amp_context():
+        if device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
     # Optimizer Groups
     hidden_weights = []
     norm_bias_params = []
@@ -91,17 +100,27 @@ def train():
         {'params': norm_bias_params, 'use_muon': False, 'lr': model_args.max_lr, 'weight_decay': 0.0}
     ]
     
-    optimizer = MuonWithAuxAdam(param_groups)
-    model = torch.compile(model)
+    if HAS_MUON:
+        optimizer = MuonWithAuxAdam(param_groups)
+    else:
+        cleaned_groups = []
+        for group in param_groups:
+            cleaned_group = {k: v for k, v in group.items() if k != "use_muon"}
+            cleaned_groups.append(cleaned_group)
+        optimizer = torch.optim.AdamW(cleaned_groups)
+    if hasattr(torch, "compile"):
+        model = torch.compile(model)
     
     # Data Loaders
-    train_dataloader = prepare_dataset('train', device, model_args.batch_size, use_ddp=use_ddp)
+    train_dataloader = prepare_dataset('train', device, model_args.batch_size, use_ddp=use_ddp, tokenizer=tokenizer, model_args=model_args)
     train_iterator = iter(train_dataloader)
     
     # Create a separate iterator for validation (just grabbing a fresh batch from stream)
     # Note: For strict validation, you'd want a separate held-out dataset shard.
-    val_dataloader = prepare_dataset('val', device, model_args.batch_size, use_ddp=use_ddp)
+    val_dataloader = prepare_dataset('val', device, model_args.batch_size, use_ddp=use_ddp, tokenizer=tokenizer, model_args=model_args)
     val_iterator = iter(val_dataloader)
+    train_history = []
+    val_history = []
 
     # Liger Loss Helper
     def compute_loss(output, targets, model_ref):
@@ -124,7 +143,7 @@ def train():
             except StopIteration:
                 break
             idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with amp_context():
                 # We ignore aux loss during validation, just check perplexity
                 out = base_model(idx)
                 if model_args.use_liger and hasattr(base_model, 'le_loss'):
@@ -134,7 +153,7 @@ def train():
                 else:
                      l = compute_loss(out, targets, base_model)
             losses.append(l.item())
-        
+
         avg_loss = torch.tensor(losses).mean().to(device)
         if use_ddp:
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
@@ -165,8 +184,7 @@ def train():
                 
             idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
             token_count += idx.numel()
-            
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with amp_context():
                 output = model(idx)
                 ref_model = model.module if use_ddp else model
                 
@@ -192,7 +210,7 @@ def train():
         if rank == 0:
             pbar.update(1)
             pbar.set_description(f"Loss: {accumulated_loss:.4f}")
-            wandb.log({"train_loss": accumulated_loss, "lr": lr, "tokens": token_count})
+            train_history.append((step, accumulated_loss))
             
             if step % model_args.save_checkpoint_iter == 0 and step > 0:
                 print(f"Saving checkpoint at step {step}")
@@ -201,10 +219,23 @@ def train():
             if step % model_args.eval_iters == 0 and step > 0:
                 val_loss = estimate_loss()
                 print(f"Validation Loss: {val_loss:.4f}")
-                wandb.log({"val_loss": val_loss})
+                val_history.append((step, val_loss))
 
     if use_ddp:
         cleanup_ddp()
+    if rank == 0 and train_history:
+        plt.figure()
+        train_steps, train_losses = zip(*train_history)
+        plt.plot(train_steps, train_losses, label="train_loss")
+        if val_history:
+            val_steps, val_losses = zip(*val_history)
+            plt.plot(val_steps, val_losses, label="val_loss")
+        plt.xlabel("step")
+        plt.ylabel("loss")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("training_curve.png")
+        plt.close()
 
 if __name__ == "__main__":
     train()
