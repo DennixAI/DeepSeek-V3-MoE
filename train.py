@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from contextlib import nullcontext
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from dotenv import load_dotenv
+from huggingface_hub import HfApi, create_repo
 
 try:
     from muon import MuonWithAuxAdam
@@ -19,6 +21,8 @@ except ImportError:
 from config import ModelArgs, get_args
 from model import DeepSeekV3
 from data import prepare_dataset, initialize_tokenizer
+
+load_dotenv() 
 
 def setup_ddp():
     dist.init_process_group(backend='nccl')
@@ -47,6 +51,24 @@ def train():
     args = get_args()
     model_args = ModelArgs()
     
+    # --- HF TOKEN HANDLING ---
+    # Prioritize env var, then config
+    hf_token = os.getenv("HF_TOKEN") or model_args.hf_token
+    if hf_token:
+        model_args.hf_token = hf_token
+        print(f"✅ Loaded HF_TOKEN from environment.")
+    else:
+        print(f"⚠️ WARNING: No HF_TOKEN found. Uploads will fail.")
+
+    # Initialize HF API and Create Repo if needed
+    hf_api = HfApi(token=hf_token)
+    if model_args.hf_repo_id and hf_token:
+        try:
+            create_repo(model_args.hf_repo_id, repo_type="model", exist_ok=True, token=hf_token)
+            print(f"🔗 Connected to Hugging Face Repo: {model_args.hf_repo_id}")
+        except Exception as e:
+            print(f"⚠️ Could not create/connect to HF repo: {e}")
+
     tokenizer = initialize_tokenizer(model_args.hf_token)
     
     use_ddp = 'RANK' in os.environ or model_args.use_ddp
@@ -63,7 +85,7 @@ def train():
         
     if rank == 0:
         print(f"Training on {device} | World Size: {world_size}")
-        print(f"Dataset: {model_args.dataset}")
+        print(f"Dataset: {model_args.dataset} ({model_args.dataset_subset})")
         print(f"Vocab Size: {model_args.vocab_size}")
     
     model = DeepSeekV3(model_args).to(device)
@@ -109,6 +131,7 @@ def train():
     if hasattr(torch, "compile"):
         model = torch.compile(model)
     
+    # Dataset Loader (Updated to use subset name)
     train_dataloader = prepare_dataset('train', device, model_args.batch_size, use_ddp=use_ddp, tokenizer=tokenizer, model_args=model_args)
     train_iterator = iter(train_dataloader)
     
@@ -140,18 +163,12 @@ def train():
             idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
             with amp_context():
                 out = base_model(idx)
-                if model_args.use_liger and hasattr(base_model, 'le_loss'):
-                     l = compute_loss(out, targets, base_model)
-                else:
-                     l = compute_loss(out, targets, base_model)
+                l = compute_loss(out, targets, base_model)
             losses.append(l.item())
 
-        if not losses:
-            return 0.0
-            
+        if not losses: return 0.0
         avg_loss = torch.tensor(losses).mean().to(device)
-        if use_ddp:
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+        if use_ddp: dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
         model.train()
         return avg_loss.item()
 
@@ -163,7 +180,9 @@ def train():
     
     for step in range(model_args.total_iters):
         lr = get_lr(step, model_args)
-        for i in range(1, 3): optimizer.param_groups[i]['lr'] = lr
+        # Update LR for non-Muon groups (index 1 and 2)
+        for i in range(1, len(optimizer.param_groups)): 
+            optimizer.param_groups[i]['lr'] = lr
             
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
@@ -213,14 +232,33 @@ def train():
             pbar.set_description(f"Loss: {accumulated_loss:.4f}")
             train_history.append((step, accumulated_loss))
             
+            # --- CHECKPOINT SAVING & UPLOADING ---
             if step % model_args.save_checkpoint_iter == 0 and step > 0:
+                ckpt_name = f"checkpoint_{step}.pt"
+                print(f"Saving checkpoint: {ckpt_name}")
+                
+                # Save locally
                 torch.save({
                     'model': base_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'step': step,
                     'args': model_args
-                }, f"checkpoint_{step}.pt")
+                }, ckpt_name)
                 
+                # Upload to HF
+                if hf_token and model_args.hf_repo_id:
+                    print(f"☁️ Uploading {ckpt_name} to Hugging Face...")
+                    try:
+                        hf_api.upload_file(
+                            path_or_fileobj=ckpt_name,
+                            path_in_repo=f"checkpoints/{ckpt_name}",
+                            repo_id=model_args.hf_repo_id,
+                            repo_type="model"
+                        )
+                        print("✅ Upload complete.")
+                    except Exception as e:
+                        print(f"❌ Upload failed: {e}")
+
             if step % model_args.eval_iters == 0 and step > 0:
                 val_loss = estimate_loss()
                 print(f"Validation Loss: {val_loss:.4f}")
@@ -229,19 +267,22 @@ def train():
     if use_ddp:
         cleanup_ddp()
         
-    if rank == 0 and train_history:
-        plt.figure()
-        train_steps, train_losses = zip(*train_history)
-        plt.plot(train_steps, train_losses, label="train_loss")
-        if val_history:
-            val_steps, val_losses = zip(*val_history)
-            plt.plot(val_steps, val_losses, label="val_loss")
-        plt.xlabel("step")
-        plt.ylabel("loss")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("training_curve.png")
-        plt.close()
+    if rank == 0:
+        print("Training complete. Saving final model...")
+        final_ckpt = "final_model.pt"
+        torch.save(base_model.state_dict(), final_ckpt)
+        
+        if hf_token and model_args.hf_repo_id:
+             try:
+                hf_api.upload_file(
+                    path_or_fileobj=final_ckpt,
+                    path_in_repo="final_model.pt",
+                    repo_id=model_args.hf_repo_id,
+                    repo_type="model"
+                )
+                print("✅ Final model uploaded to Hugging Face.")
+             except Exception as e:
+                print(f"❌ Final upload failed: {e}")
 
 if __name__ == "__main__":
     train()
