@@ -27,7 +27,7 @@ class FineWebStreamDataset(IterableDataset):
         try:
             self.dataset = load_dataset(
                 dataset_name,
-                name=dataset_config,
+                name="sample-10BT",  
                 split="train",
                 streaming=True,
                 token=hf_token
