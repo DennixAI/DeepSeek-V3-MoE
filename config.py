@@ -7,7 +7,8 @@ class ModelArgs:
     dim: int = 768                 
     n_layers: int = 16              
     n_heads: int = 12               # 768 / 64 = 12 heads
-    n_kv_heads: int = 4             # Standard GQA (Grouped Query Attention)
+    n_kv_heads: int = 4             
+    # Standard GQA (Grouped Query Attention)
     
     # --- MoE (Mixture of Experts) Config ---
     num_experts: int = 8            # Reduced from 64. Standard for small MoEs.
@@ -22,9 +23,9 @@ class ModelArgs:
     norm_eps: float = 1e-6
     
     # --- Training & Data ---
-    vocab_size: int = 128256        # Llama 3 Tokenizer 
-    max_seq_len: int = 2048        
-    batch_size: int = 8             # Effective batch size per GPU
+    vocab_size: int = 50257         # for tinystories
+    max_seq_len: int = 512
+    batch_size: int = 16            # Effective batch size per GPU
     
     # --- Optimization ---
     lr_decay_iters: int = 50000     # Adjusted for shorter run

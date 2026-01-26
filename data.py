@@ -6,14 +6,36 @@ import torch.distributed as dist
 from config import ModelArgs
 
 def initialize_tokenizer(hf_token=None):
+    # TinyStories is standardly used with GPT-2 tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B", token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained("gpt2", token=hf_token)
     except Exception:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+class TinyStoriesStreamingDataset(IterableDataset): # Renamed for clarity
+    def __init__(self, split, tokenizer, seq_len, batch_size, world_size=1, rank=0, infinite=True, dataset_name="roneneldan/TinyStories", hf_token=None):
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.split = "train" if split == "train" else "validation"
+        self.world_size = world_size
+        self.rank = rank
+        self.infinite = infinite
+        
+        # Simplified for TinyStories (no 'name' config needed)
+        self.dataset = load_dataset(
+            dataset_name,
+            split=self.split,
+            streaming=True,
+            token=hf_token
+        )
+
+        if self.world_size > 1:
+            self.dataset = self.dataset.shard(num_shards=self.world_size, index=self.rank)
+
 
 class FineWebStreamDataset(IterableDataset):
     def __init__(self, split, tokenizer, seq_len, batch_size, world_size=1, rank=0, infinite=True, dataset_name="HuggingFaceFW/fineweb-edu", dataset_config="sample-10BT", hf_token=None):

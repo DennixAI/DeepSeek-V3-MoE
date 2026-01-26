@@ -103,6 +103,8 @@ def train():
             pass
 
     tokenizer = initialize_tokenizer(model_args.hf_token)
+    model_args.vocab_size = len(tokenizer) 
+
     
     # DDP Setup
     use_ddp = 'RANK' in os.environ or model_args.use_ddp
